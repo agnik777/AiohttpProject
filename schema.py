@@ -14,7 +14,6 @@ def get_http_error(error_cls, message: str | dict | list) -> web.HTTPError:
 
 
 class BaseUser(BaseModel):
-    name: str
     password: str
     email: str
 
@@ -26,8 +25,12 @@ class BaseUser(BaseModel):
         return v
 
 
-class CreateUser(BaseUser):
+class LoginUser(BaseUser):
     pass
+
+
+class CreateUser(BaseUser):
+    name: str
 
 
 class UpdateUser(BaseUser):
@@ -41,8 +44,8 @@ class CreateAnnouncement(BaseModel):
     description: str
 
 
-def validate_data(schema_cls: type[CreateUser, UpdateUser, CreateAnnouncement],
-                  data: dict) -> dict:
+def validate_data(schema_cls: type[LoginUser, CreateUser, UpdateUser,
+CreateAnnouncement], data: dict) -> dict:
     try:
         schema = schema_cls(**data)
         return schema.model_dump(exclude_unset=True)

@@ -1,16 +1,86 @@
+import os
+from dotenv import load_dotenv
+import jwt
 import bcrypt
 
-from db import init_orm, close_orm
+from datetime import timedelta, datetime, timezone
 from aiohttp import web
-
-from db import Session, Announcement, User
+from sqlalchemy import select
+from db import init_orm, close_orm, Session, Announcement, User
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from schema import (validate_data, CreateUser, UpdateUser, CreateAnnouncement,
-                    get_http_error)
+from schema import (validate_data, LoginUser, CreateUser, UpdateUser,
+                    CreateAnnouncement, get_http_error)
 
 
-app = web.Application()
+load_dotenv()
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 15))
+WHITELIST_ROUTES = {
+    'login', 'user_detail', 'user_create', 'announcements_detail'
+}
+
+async def create_access_token(data: dict,
+                              expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def verify_password(plain_password: str, hashed_password: str):
+    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+
+def hash_password(password: str):
+    password = password.encode()
+    password = bcrypt.hashpw(password, bcrypt.gensalt())
+    password = password.decode()
+    return password
+
+async def authenticate_user(email: str, password: str, session: AsyncSession):
+    stmt = select(User).where(User.email == email)
+    result = await session.execute(stmt)
+    user = result.scalars().first()
+    if not user or not await verify_password(password, user.password):
+        return False
+    return user
+
+async def add_user(user: User, session: AsyncSession):
+    session.add(user)
+    try:
+        await session.commit()
+    except IntegrityError:
+        raise get_http_error(web.HTTPConflict,
+                             'Email already registered')
+
+async def add_announcement(announcement: Announcement, session: AsyncSession):
+    session.add(announcement)
+    await session.commit()
+
+
+@web.middleware
+async def jwt_auth_middleware(request: web.Request, handler):
+    route_name = request.match_info.route.name
+    if route_name in WHITELIST_ROUTES:
+        return await handler(request)
+    token = request.headers.get("Authorization")
+    if token is None:
+        return web.json_response({"error": "Missing authorization token."},
+                                 status=401)
+    try:
+        token = token.split("Bearer ").pop()
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        request['current_user'] = payload.get("sub")
+    except jwt.DecodeError:
+        return web.json_response({"error": "Invalid token."}, status=401)
+    except jwt.ExpiredSignatureError:
+        return web.json_response({"error": "Token has expired."},
+                                 status=401)
+    return await handler(request)
+
+app = web.Application(middlewares=[jwt_auth_middleware])
 
 
 async def orm_context(app: web.Application):
@@ -30,24 +100,6 @@ async def session_middleware(request: web.Request, handler):
 app.cleanup_ctx.append(orm_context)
 app.middlewares.append(session_middleware)
 
-def hash_password(password: str):
-    password = password.encode()
-    password = bcrypt.hashpw(password, bcrypt.gensalt())
-    password = password.decode()
-    return password
-
-async def add_user(user: User, session: AsyncSession):
-    session.add(user)
-    try:
-        await session.commit()
-    except IntegrityError:
-        raise get_http_error(web.HTTPConflict,
-                             'Email already registered')
-
-async def add_announcement(announcement: Announcement, session: AsyncSession):
-    session.add(announcement)
-    await session.commit()
-
 
 class BaseView(web.View):
 
@@ -56,11 +108,11 @@ class BaseView(web.View):
         return self.request.session
 
     @property
-    def user_id(self) -> int:
-        return int(self.request.match_info['user_id'])
+    def current_user(self) -> User:
+        return int(self.request.get('current_user'))
 
-    async def get_user(self):
-        user = await self.session.get(User, self.user_id)
+    async def get_current_user(self):
+        user = await self.session.get(User, self.current_user)
         if user is None:
             error = get_http_error(web.HTTPNotFound,
                                    'User not found')
@@ -91,29 +143,31 @@ class AnnouncementsView(BaseView):
     async def post(self):
         json_data = await self.request.json()
         json_data = validate_data(CreateAnnouncement, json_data)
-        user = await self.get_user()
+        user = await self.get_current_user()
         announcement = Announcement(
             title=json_data.get('title'),
             description=json_data.get('description'),
-            owner=self.user_id
+            owner=self.current_user
         )
         await add_announcement(announcement, self.session)
-        return web.json_response([announcement.id_dict, user.id_dict])
+        return web.json_response([announcement.id_dict, user.id_dict],
+                                 status=201)
 
     async def delete(self):
         announcement = await self.get_announcement()
-        if announcement.owner != self.user_id:
+        if announcement.owner != self.current_user:
             return web.json_response(
                 {'error': 'Deletion prohibited'}, status=400
             )
         await self.session.delete(announcement)
         await self.session.commit()
-        return web.json_response({'status': 'Announcement deleted'})
+        return web.json_response({'status': 'Announcement deleted'},
+                                 status=204)
 
     async def patch(self):
         json_data = await self.request.json()
         announcement = await self.get_announcement()
-        if announcement.owner != self.user_id:
+        if announcement.owner != self.current_user:
             return web.json_response(
                 {'error': 'Announcement cannot be modified'}, status=400
             )
@@ -126,6 +180,18 @@ class AnnouncementsView(BaseView):
 
 
 class UsersView(BaseView):
+
+    @property
+    def user_id(self) -> int:
+        return int(self.request.match_info['user_id'])
+
+    async def get_user(self):
+        user = await self.session.get(User, self.user_id)
+        if user is None:
+            error = get_http_error(web.HTTPNotFound,
+                                   'User not found')
+            raise error
+        return user
 
     async def get(self):
         user = await self.get_user()
@@ -140,18 +206,18 @@ class UsersView(BaseView):
             password=hash_password(json_data['password'])
         )
         await  add_user(user, self.session)
-        return web.json_response(user.id_dict)
+        return web.json_response(user.id_dict, status=201)
 
     async def delete(self):
-        user = await self.get_user()
+        user = await self.get_current_user()
         await self.session.delete(user)
         await self.session.commit()
-        return web.json_response({'status': 'User deleted'})
+        return web.json_response({'status': 'User deleted'}, status=204)
 
     async def patch(self):
         json_data = await self.request.json()
         json_data = validate_data(UpdateUser, json_data)
-        user = await self.get_user()
+        user = await self.get_current_user()
         if 'name' in json_data:
             user.name = json_data['name']
         if 'email' in json_data:
@@ -162,19 +228,37 @@ class UsersView(BaseView):
         return web.json_response(user.id_dict)
 
 
+class LoginView(BaseView):
+    async def post(self):
+        json_data = await self.request.json()
+        json_data = validate_data(LoginUser, json_data)
+        email = json_data.get("email")
+        password = json_data.get("password")
+        user = await authenticate_user(email, password, self.session)
+        if not user:
+            return web.json_response({"error": "Invalid credentials"},
+                                     status=401)
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = await create_access_token(
+            data={"sub": str(user.id)}, expires_delta=access_token_expires)
+        return web.json_response({"token": access_token})
+
+
 app.add_routes(
     [
         web.get(r'/announcements/{announcement_id:\d+}',
-                AnnouncementsView),
-        web.post(r'/announcements/{user_id:\d+}', AnnouncementsView),
-        web.patch(r'/announcements/{user_id:\d+}/{announcement_id:\d+}',
-                  AnnouncementsView),
-        web.delete(r'/announcements/{user_id:\d+}/{announcement_id:\d+}',
-                   AnnouncementsView),
-        web.get(r'/users/{user_id:\d+}', UsersView),
-        web.post('/users', UsersView),
-        web.patch(r'/users/{user_id:\d+}', UsersView),
-        web.delete(r'/users/{user_id:\d+}', UsersView)
+                AnnouncementsView, name="announcements_detail"),
+        web.post('/announcements', AnnouncementsView,
+                 name="announcements_create"),
+        web.patch(r'/announcements/{announcement_id:\d+}',
+                  AnnouncementsView, name="announcements_update"),
+        web.delete(r'/announcements/{announcement_id:\d+}',
+                   AnnouncementsView, name="announcements_delete"),
+        web.get(r'/users/{user_id:\d+}', UsersView, name='user_detail'),
+        web.post('/users', UsersView, name='user_create'),
+        web.patch('/users', UsersView, name='user_update'),
+        web.delete('/users', UsersView, name='user_delete'),
+        web.post('/login', LoginView, name='login'),
     ]
 )
 
